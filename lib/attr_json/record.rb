@@ -33,8 +33,8 @@ module AttrJson
       # A record loaded from the db syncs lazily instead, see below. (A `dup` is
       # also persisted? here, but has the instance variable from its source.)
       after_initialize do
-        if persisted? && !instance_variable_defined?(:@attr_json_unsynced)
-          attr_json_defer_sync
+        if persisted? && !instance_variable_defined?(:@attr_json_lazily_synced) && self.class.attr_json_lazy_sync?
+          @attr_json_lazily_synced = Set.new
         else
           attr_json_sync_to_rails_attributes
         end
@@ -64,7 +64,7 @@ module AttrJson
     # mutation of mutable object will effect both places, for instance for dirty
     # tracking.
     def attr_json_sync_to_rails_attributes
-      @attr_json_unsynced = nil
+      @attr_json_lazily_synced = nil
       attr_json_sync_definitions(self.class.attr_json_registry.definitions)
     end
 
@@ -85,13 +85,13 @@ module AttrJson
 
     one_attribute_methods.each do |method_name|
       define_method(method_name) do |attr_name, &block|
-        attr_json_sync_if_unsynced(attr_name)
+        attr_json_sync_attribute_if_unsynced(attr_name)
         super(attr_name, &block)
       end
     end
 
     def write_attribute(attr_name, value)
-      attr_json_sync_if_unsynced(attr_name)
+      attr_json_sync_attribute_if_unsynced(attr_name)
       super
     end
 
@@ -121,9 +121,11 @@ module AttrJson
       super
     end
 
+    # Later Rails runs after_initialize on the record we become, which then
+    # believes it was just loaded, while it has our synced rails attributes.
     def becomes(klass)
       attr_json_sync_if_unsynced
-      super
+      super.tap { |became| became.instance_variable_set(:@attr_json_lazily_synced, nil) }
     end
 
     def touch(*names, **options)
@@ -139,30 +141,47 @@ module AttrJson
 
     private
 
-    def attr_json_defer_sync
-      @attr_json_unsynced = Set.new(self.class.attr_json_registry.attribute_names)
-    end
+    # @attr_json_lazily_synced is nil, unless this record syncs lazily and is
+    # not done: then it has the names of the attributes synced so far.
 
-    # Sync the one attribute named if it is still unsynced, or with no argument
-    # all that are.
-    def attr_json_sync_if_unsynced(attr_name = nil)
-      unsynced = @attr_json_unsynced
-      return if unsynced.nil?
-
-      # so the rails attribute methods the sync calls do not start another sync
-      @attr_json_unsynced = nil
+    def attr_json_sync_attribute_if_unsynced(attr_name)
+      synced = @attr_json_lazily_synced
+      return if synced.nil? || !attr_name.respond_to?(:to_sym)
 
       registry = self.class.attr_json_registry
-      if attr_name
-        definition = registry[attr_name]
-        if definition && unsynced.delete?(definition.name)
-          attr_json_sync_from_container(definition.container_attribute, [definition])
-        end
-      else
-        attr_json_sync_definitions(registry.definitions.select { |definition| unsynced.delete?(definition.name) })
+      # someone with the container can change values before we synced them
+      return attr_json_sync_if_unsynced if registry.container_attribute?(attr_name)
+
+      definition = registry[attr_name]
+      return if definition.nil? || synced.include?(definition.name)
+
+      attr_json_without_lazy_sync do
+        attr_json_sync_from_container(definition.container_attribute, [definition])
       end
+      synced << definition.name
+    end
+
+    def attr_json_sync_if_unsynced
+      synced = @attr_json_lazily_synced
+      return if synced.nil?
+
+      attr_json_without_lazy_sync do
+        attr_json_sync_definitions(self.class.attr_json_registry.definitions.reject { |d| synced.include?(d.name) })
+      end
+      @attr_json_lazily_synced = nil
+    end
+
+    # The sync itself, and our getters and setters, use rails attribute methods
+    # that would otherwise start a sync.
+    def attr_json_without_lazy_sync
+      synced, @attr_json_lazily_synced = @attr_json_lazily_synced, nil
+      yield
     ensure
-      @attr_json_unsynced = unsynced unless unsynced.nil? || unsynced.empty?
+      @attr_json_lazily_synced = synced
+    end
+
+    def attr_json_container(container_attribute)
+      attr_json_without_lazy_sync { public_send(container_attribute) }
     end
 
     def attr_json_sync_definitions(definitions)
@@ -175,7 +194,7 @@ module AttrJson
       # column may have eg been left out of an explicit 'select'
       return unless has_attribute?(container_attribute)
 
-      container_value    = public_send(container_attribute)
+      container_value    = attr_json_container(container_attribute)
 
       # isn't expected to be possible to be nil rather than empty hash, but
       # if it is from some edge case, well, we don't have values to sync, fine
@@ -206,6 +225,20 @@ module AttrJson
     public
 
     class_methods do
+      # A reader made by alias_attribute reads the rails attribute directly,
+      # with nothing for us to override, so such a class syncs on load.
+      def attr_json_lazy_sync?
+        if @attr_json_lazy_sync.nil?
+          @attr_json_lazy_sync = attribute_aliases.each_value.none? { |name| attr_json_registry.has_attribute?(name) }
+        end
+        @attr_json_lazy_sync
+      end
+
+      def alias_attribute(new_name, old_name)
+        @attr_json_lazy_sync = nil
+        super
+      end
+
       # Access or set class-wide json_attribute_config. Inherited by sub-classes,
       # but setting on sub-classes is unique to subclass. Similar to how
       # rails class_attribute's are used.
@@ -287,6 +320,8 @@ module AttrJson
         # this container attribute hsa been encountered for this specific class. The registry
         # helps us keep track. Kinda messy, in future we may want a more explicit API
         # that does not require us to implicitly track first-time per-container.
+        @attr_json_lazy_sync = nil
+
         unless self.attr_json_registry.container_attribute_registered?(model: self, attribute_name: container_attribute.to_sym)
            attribute container_attribute.to_sym, AttrJson::Type::ContainerAttribute.new(self, container_attribute), default: -> { {} }
            self.attr_json_registry.register_container_attribute(model: self, attribute_name: container_attribute.to_sym)
@@ -327,14 +362,22 @@ module AttrJson
         _attr_jsons_module.module_eval do
           define_method("#{name}=") do |value|
             # rails dirty tracking needs the value from the db to compare to
-            attr_json_sync_if_unsynced(name)
+            attr_json_sync_attribute_if_unsynced(name)
 
             super(value) # should write to rails attribute
 
             # write to container hash, with value read from attribute to try to keep objects
             # sync'd to exact same object in rails attribute and container hash.
             attribute_def = self.class.attr_json_registry.fetch(name.to_sym)
-            public_send(attribute_def.container_attribute)[attribute_def.store_key] = read_attribute(name)
+            attr_json_container(attribute_def.container_attribute)[attribute_def.store_key] = read_attribute(name)
+          end
+
+          define_method("#{name}") do
+            attr_json_sync_attribute_if_unsynced(name)
+
+            # read from container hash -- we consider that the canonical location.
+            attribute_def = self.class.attr_json_registry.fetch(name.to_sym)
+            attr_json_container(attribute_def.container_attribute)[attribute_def.store_key]
           end
 
           # rails methods for this attribute that we can't override for all attributes at once
@@ -343,23 +386,24 @@ module AttrJson
             next if suffix == "_for_database" && ActiveRecord.version < Gem::Version.new("6.1")
 
             define_method("#{name}#{suffix}") do
-              attr_json_sync_if_unsynced(name)
+              attr_json_sync_attribute_if_unsynced(name)
               super()
             end
           end
 
-          define_method("#{name}") do
-            # read from container hash -- we consider that the canonical location.
-            attribute_def = self.class.attr_json_registry.fetch(name.to_sym)
-            container_value = public_send(attribute_def.container_attribute)
-
-            # for dirty tracking to see an in-place mutation of the value we return.
-            # A frozen value (nil, true, a number) can't be mutated.
-            if @attr_json_unsynced && !container_value[attribute_def.store_key].frozen?
-              attr_json_sync_if_unsynced(name)
+          # Someone with the container can change values in it, or replace it,
+          # before we synced them.
+          container_attribute = attr_json_definition.container_attribute
+          unless method_defined?(container_attribute)
+            define_method(container_attribute) do
+              attr_json_sync_if_unsynced
+              super()
             end
 
-            container_value[attribute_def.store_key]
+            define_method("#{container_attribute}=") do |value|
+              attr_json_sync_if_unsynced
+              super(value)
+            end
           end
         end
 

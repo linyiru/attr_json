@@ -40,10 +40,8 @@ RSpec.describe "lazy sync to rails attributes" do
   # Syncs everything on load, as attr_json did before the sync became lazy.
   let(:eager_class) do
     stub_const("EagerSyncProduct", Class.new(lazy_class) do
-      private
-
-      def attr_json_defer_sync
-        attr_json_sync_to_rails_attributes
+      def self.attr_json_lazy_sync?
+        false
       end
     end)
   end
@@ -227,6 +225,25 @@ RSpec.describe "lazy sync to rails attributes" do
       record.save!
       [before, record.read_attribute(:str)]
     },
+    "a value written straight into the container, before anything else" => ->(record) {
+      record.json_attributes["str"] = "direct"
+      [record.str_was, record.str_changed?, record.changes, record.read_attribute(:str), record.str]
+    },
+    "a value mutated in place through the container" => ->(record) {
+      record.json_attributes["str_array"] << "two"
+      record[:other_attributes]["other_str"] << "more"
+      [record.str_array_changed?, record.str_array_was, record.other_str_changed?, record.changes]
+    },
+    "a container replaced" => ->(record) {
+      record.json_attributes = { "str" => "replaced", "int" => 9 }
+      before = [record.str_was, record.int_in_database, record.changes, record.str, record.read_attribute(:str)]
+      record.save!
+      [before, record.saved_changes, record.attributes.except("id")]
+    },
+    "a container replaced through assign_attributes" => ->(record) {
+      record.assign_attributes(other_attributes: { "other_str" => "replaced" }, int: 9)
+      [record.other_str_was, record.changes, record.other_str]
+    },
     "restore_attributes" => ->(record) {
       record.str = "new"
       record.int = 8
@@ -331,6 +348,13 @@ RSpec.describe "lazy sync to rails attributes" do
       other = record.becomes(LazySyncProduct)
       [other.str_was, other.read_attribute(:int), other.changed?, other.attributes.except("id")]
     },
+    "becomes, with unsaved changes" => ->(record) {
+      record.str = "new"
+      record.embedded.str = "new"
+      other = record.becomes(LazySyncProduct)
+      read = [other.str, other.read_attribute(:int), other.embedded, other.attributes.except("id")]
+      [read, other.changes, record.changes, other.str_was]
+    },
     "destroy" => ->(record) {
       record.destroy
       [record.str, record.embedded, record.read_attribute(:str), record.attributes.except("id"), record.changed?, record.frozen?]
@@ -375,6 +399,28 @@ RSpec.describe "lazy sync to rails attributes" do
     end
   end
 
+  describe "a class with alias_attribute for a json attribute" do
+    let(:aliasing_class) do
+      stub_const("AliasingProduct", Class.new(lazy_class) do
+        alias_attribute :title, :str
+      end)
+    end
+
+    it "reads the stored value through the alias" do
+      record = aliasing_class.find(create_row)
+
+      expect(record.title).to eq "stored"
+      expect(record.title_was).to eq "stored"
+      expect(record.title_changed?).to be false
+    end
+
+    it "does not stop its superclass from syncing lazily" do
+      aliasing_class
+      expect(lazy_class.attr_json_lazy_sync?).to be true
+      expect(aliasing_class.attr_json_lazy_sync?).to be false
+    end
+  end
+
   describe "when the sync happens" do
     let!(:record) { lazy_class.find(create_row) }
 
@@ -395,16 +441,11 @@ RSpec.describe "lazy sync to rails attributes" do
       expect(unsynced_attributes(record)).to eq(%w[str int bool str_array embedded other_str])
     end
 
-    it "is not on reading a value that can not be mutated" do
-      expect(record.int).to eq 7
-      expect(record.bool).to be false
-      expect(unsynced_attributes(record)).to eq(%w[str int bool str_array embedded other_str])
-    end
-
-    it "is for that attribute only on reading a value that can be mutated" do
+    it "is for that attribute only on reading it" do
       record.str
       record.embedded
-      expect(unsynced_attributes(record)).to eq(%w[int bool str_array other_str])
+      record.bool
+      expect(unsynced_attributes(record)).to eq(%w[int str_array other_str])
     end
 
     it "is for that attribute only on a write" do
