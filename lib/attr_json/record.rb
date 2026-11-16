@@ -44,6 +44,12 @@ module AttrJson
         end
       end
 
+      # A save replaces the Rails attributes with new ones, and a rollback of
+      # the transaction it is in puts the old ones back. Sync before that.
+      before_save do
+        attr_json_sync_if_unsynced
+      end
+
       # After a safe, rails attribute dirty tracking ends up re-creating
       # new objects for attribute values, so we need to sync again
       # so mutation effects both.
@@ -66,14 +72,20 @@ module AttrJson
       attr_json_sync_definitions(self.class.attr_json_registry.definitions)
     end
 
-    # The methods below are every way to get at the Rails attributes other than
-    # our own getters and setters. Each first runs the sync that a record loaded
-    # from the db still owes: for one attribute if it is about one attribute,
-    # else for all of them.
+    # A record loaded from the db has not synced its Rails attributes yet. An
+    # attribute nobody touched has no changes, so dirty tracking is right without
+    # the sync. Our getters and setters sync the attribute they are for. The
+    # methods below are the other ways to get at the value of a Rails attribute:
+    # each first runs the sync still owed, for one attribute if it is about one
+    # attribute, else for all of them.
+
+    # The *_for_database methods are not in every Rails version we support. We
+    # look for them in their module: mentioning ActiveRecord::Base here would
+    # load it too early.
+    before_type_cast = ActiveRecord::AttributeMethods::BeforeTypeCast
 
     %i[attributes attributes_before_type_cast attributes_for_database].each do |method_name|
-      next unless ActiveRecord::AttributeMethods.method_defined?(method_name) ||
-        ActiveRecord::AttributeMethods::BeforeTypeCast.method_defined?(method_name)
+      next if method_name == :attributes_for_database && !before_type_cast.method_defined?(method_name)
 
       define_method(method_name) do
         attr_json_sync_if_unsynced
@@ -81,9 +93,12 @@ module AttrJson
       end
     end
 
-    %i[read_attribute _read_attribute read_attribute_before_type_cast read_attribute_for_database].each do |method_name|
-      next unless ActiveRecord::AttributeMethods::Read.method_defined?(method_name) ||
-        ActiveRecord::AttributeMethods::BeforeTypeCast.method_defined?(method_name)
+    %i[
+      read_attribute read_attribute_before_type_cast read_attribute_for_database
+      attribute_present? attribute_for_inspect attribute_was attribute_in_database
+      attribute_changed_in_place?
+    ].each do |method_name|
+      next if method_name == :read_attribute_for_database && !before_type_cast.method_defined?(method_name)
 
       define_method(method_name) do |attr_name, &block|
         attr_json_sync_if_unsynced(attr_name)
@@ -93,6 +108,16 @@ module AttrJson
 
     def write_attribute(attr_name, value)
       attr_json_sync_if_unsynced(attr_name)
+      super
+    end
+
+    def inspect
+      attr_json_sync_if_unsynced
+      super
+    end
+
+    def pretty_print(pp)
+      attr_json_sync_if_unsynced
       super
     end
 
@@ -113,17 +138,33 @@ module AttrJson
       super
     end
 
-    # Nothing can be written to the Rails attributes once frozen, as a
-    # destroyed record is.
+    # Nothing can be written to the Rails attributes once frozen.
     def freeze
       attr_json_sync_if_unsynced
       super
     end
 
+    # A destroyed record is frozen, and by then no longer #persisted?, which
+    # the sync looks at.
+    %i[destroy delete].each do |method_name|
+      define_method(method_name) do
+        attr_json_sync_if_unsynced
+        super()
+      end
+    end
+
+    # Like a save, replaces the Rails attributes, and can be rolled back.
+    def touch(*)
+      attr_json_sync_if_unsynced
+      super
+    end
+
     # reload swaps in the Rails attributes of a freshly loaded record, which
-    # have not been synced.
+    # have not been synced. We do not defer here: if we are in a transaction
+    # that rolls back, the Rails attributes from before the reload come back,
+    # and those are synced.
     def reload(*)
-      super.tap { attr_json_defer_sync }
+      super.tap { attr_json_sync_to_rails_attributes }
     end
 
     private
@@ -155,28 +196,6 @@ module AttrJson
       end
     ensure
       @attr_json_unsynced = unsynced unless unsynced.nil? || unsynced.empty?
-    end
-
-    # All of ActiveRecord's dirty tracking reads the Rails attributes through here.
-    def mutations_from_database
-      attr_json_sync_if_unsynced
-      super
-    end
-
-    # A rollback puts back the Rails attributes remembered here, which a save
-    # in the transaction replaces with new ones. Sync them before that happens.
-    def remember_transaction_record_state
-      attr_json_sync_if_unsynced
-      super
-    end
-
-    # What `name_before_type_cast`, `name_for_database` and `name_came_from_user?`
-    # are dispatched to.
-    %i[attribute_before_type_cast attribute_for_database attribute_came_from_user?].each do |method_name|
-      define_method(method_name) do |attr_name|
-        attr_json_sync_if_unsynced(attr_name)
-        super(attr_name)
-      end
     end
 
     def attr_json_sync_definitions(definitions)
@@ -351,6 +370,18 @@ module AttrJson
             # sync'd to exact same object in rails attribute and container hash.
             attribute_def = self.class.attr_json_registry.fetch(name.to_sym)
             public_send(attribute_def.container_attribute)[attribute_def.store_key] = read_attribute(name)
+          end
+
+          # Rails methods for this one attribute that read its rails attribute
+          # without going through anything we can override for all attributes.
+          %w[_before_type_cast _for_database _came_from_user? _will_change!].each do |suffix|
+            # Rails 6.0 has no `name_for_database`
+            next if suffix == "_for_database" && ActiveRecord.version < Gem::Version.new("6.1")
+
+            define_method("#{name}#{suffix}") do
+              attr_json_sync_if_unsynced(name)
+              super()
+            end
           end
 
           define_method("#{name}") do

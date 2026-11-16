@@ -87,10 +87,52 @@ RSpec.describe "lazy sync to rails attributes" do
     "read_attribute and []" => ->(record) {
       [record.read_attribute(:str), record[:int], record["bool"], record.read_attribute("other_str"), record[:embedded]]
     },
-    "_read_attribute" => ->(record) { record._read_attribute("str") },
+    "attribute_present?" => ->(record) { [record.attribute_present?(:str), record.attribute_present?(:date), record.has_attribute?(:int)] },
+    "pretty_print" => ->(record) {
+      require "pp"
+      record.pretty_inspect.gsub(/#<[^ \n]+/, "").sub(/id: \d+/, "")
+    },
     "attributes" => ->(record) { record.attributes.except("id") },
     "inspect" => ->(record) { [record.attribute_for_inspect(:str), record.inspect.gsub(/#<[^ ]+/, "").sub(/id: \d+/, "")] },
-    "read_attribute_before_type_cast" => ->(record) { [record.read_attribute_before_type_cast(:str), record.int_before_type_cast] },
+    "read_attribute_before_type_cast" => ->(record) {
+      [record.read_attribute_before_type_cast(:str), record.int_before_type_cast, record.embedded_before_type_cast]
+    },
+    "came_from_user?" => ->(record) { [record.str_came_from_user?, record.int_came_from_user?] },
+    "for_database" => ->(record) { record.respond_to?(:str_for_database) && [record.str_for_database, record.embedded_for_database] },
+    "will_change!" => ->(record) {
+      record.str_will_change!
+      record.str << "more"
+      record.int_will_change!
+      [record.changes, record.str_was, record.int_was]
+    },
+    "every dirty tracking method, on an untouched record" => ->(record) {
+      [
+        record.changed, record.changed_attributes, record.changes_to_save, record.attributes_in_database,
+        record.str_changed?, record.attribute_changed?(:int), record.str_change, record.embedded_change,
+        record.will_save_change_to_str?, record.str_change_to_be_saved, record.attribute_changed_in_place?(:str),
+        record.saved_changes, record.str_previously_changed?, record.str_previous_change, record.saved_change_to_int?,
+        record.str_before_last_save
+      ]
+    },
+    "every dirty tracking method, after a write and an in place mutation" => ->(record) {
+      record.int = 8
+      record.str << "more"
+      record.embedded.str = "new"
+      [
+        record.changed.sort, record.changed_attributes, record.changes_to_save, record.attributes_in_database,
+        record.str_changed?, record.attribute_changed?(:int, from: 7, to: 8), record.bool_changed?, record.str_change,
+        record.will_save_change_to_str?, record.int_change_to_be_saved, record.attribute_changed_in_place?(:str),
+        record.other_str_was, record.bool_in_database, record.has_changes_to_save?
+      ]
+    },
+    "restore and clear a single attribute" => ->(record) {
+      record.str = "new"
+      record.int = 8
+      record.restore_str!
+      record.clear_attribute_changes([:int])
+      record.clear_attribute_changes(["bool"])
+      [record.changes, record.str, record.read_attribute(:int), record.bool_was]
+    },
     "attributes_before_type_cast" => ->(record) { record.attributes_before_type_cast.slice("str", "int", "bool", "other_str") },
     "read_attribute_for_database" => ->(record) {
       record.respond_to?(:read_attribute_for_database) && record.read_attribute_for_database(:str)
@@ -212,6 +254,50 @@ RSpec.describe "lazy sync to rails attributes" do
       end
       [record.changed.sort, record.str_was, record.read_attribute(:str), record.read_attribute(:int), record.embedded_was]
     },
+    "a rolled back transaction that touched the record" => ->(record) {
+      record.class.transaction do
+        record.touch
+        record.str
+        record.read_attribute(:int)
+        raise ActiveRecord::Rollback
+      end
+      [record.changed, record.str_was, record.read_attribute(:int), record.attributes.except("id"), record.embedded_was]
+    },
+    "a rolled back transaction that saved and reloaded the record" => ->(record) {
+      record.str = "new"
+      record.class.transaction do
+        record.save!
+        record.reload
+        record.embedded
+        raise ActiveRecord::Rollback
+      end
+      record.int
+      record.str
+      [record.changes, record.str_was, record.read_attribute(:int), record.attributes.except("id")]
+    },
+    "a rolled back transaction that destroyed the record" => ->(record) {
+      record.class.transaction do
+        record.destroy
+        raise ActiveRecord::Rollback
+      end
+      record.str << "more"
+      [record.changes, record.read_attribute(:int), record.frozen?, record.destroyed?]
+    },
+    "a nested transaction rolled back" => ->(record) {
+      record.class.transaction do
+        record.update!(int: 8)
+        record.class.transaction(requires_new: true) do
+          record.update!(str: "inner")
+          raise ActiveRecord::Rollback
+        end
+      end
+      [record.changes, record.str_was, record.int_was, record.attributes.except("id")]
+    },
+    "increment and toggle" => ->(record) {
+      record.increment(:int)
+      record.toggle(:bool)
+      [record.changes, record.read_attribute(:int), record[:bool]]
+    },
     "reload of an untouched record" => ->(record) {
       record.class.where(id: record.id).update_all(%q{json_attributes = jsonb_set(json_attributes, '{str}', '"fromdb"')})
       record.reload
@@ -247,6 +333,10 @@ RSpec.describe "lazy sync to rails attributes" do
     "destroy" => ->(record) {
       record.destroy
       [record.str, record.embedded, record.read_attribute(:str), record.attributes.except("id"), record.changed?, record.frozen?]
+    },
+    "delete" => ->(record) {
+      record.delete
+      [record.str, record.read_attribute(:str), record.attributes.except("id"), record.changed?, record.frozen?]
     },
     "freeze" => ->(record) {
       record.freeze
@@ -321,8 +411,20 @@ RSpec.describe "lazy sync to rails attributes" do
       expect(unsynced_attributes(record)).to eq(%w[str bool str_array embedded other_str])
     end
 
-    it "is for all attributes on a use of dirty tracking" do
-      record.changed?
+    it "is not on a use of dirty tracking for the whole record" do
+      expect(record.changed?).to be false
+      expect(record.changes).to eq({})
+      expect(unsynced_attributes(record)).to eq(%w[str int bool str_array embedded other_str])
+    end
+
+    it "is for all attributes on reading them all" do
+      record.attributes
+      expect(unsynced_attributes(record)).to eq([])
+    end
+
+    it "is for all attributes before a save" do
+      record.string_type = "new"
+      record.save!
       expect(unsynced_attributes(record)).to eq([])
     end
 
