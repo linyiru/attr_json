@@ -256,7 +256,8 @@ RSpec.describe "lazy sync to rails attributes" do
     },
     "a rolled back transaction that touched the record" => ->(record) {
       record.class.transaction do
-        record.touch
+        record.touch(:datetime_type)
+        record.touch(:datetime_type, time: Time.utc(2020, 2, 2))
         record.str
         record.read_attribute(:int)
         raise ActiveRecord::Rollback

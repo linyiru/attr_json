@@ -30,12 +30,8 @@ module AttrJson
 
       # Ensure that rails attributes tracker knows about values we just fetched.
       #
-      # For a record loaded from the db the sync is deferred, so a record
-      # pays for it only if (and for the attributes where) it is needed.
-      # See #attr_json_sync_if_unsynced.
-      #
-      # A `dup` also arrives here as persisted, but with the instance variable
-      # already copied from its source; it is synced right away, as is a new record.
+      # A record loaded from the db syncs lazily instead, see below. (A `dup` is
+      # also persisted? here, but has the instance variable from its source.)
       after_initialize do
         if persisted? && !instance_variable_defined?(:@attr_json_unsynced)
           attr_json_defer_sync
@@ -44,8 +40,8 @@ module AttrJson
         end
       end
 
-      # A save replaces the Rails attributes with new ones, and a rollback of
-      # the transaction it is in puts the old ones back. Sync before that.
+      # A save replaces the rails attributes with new objects, and a transaction
+      # rollback brings the old ones back: they have to be synced by now.
       before_save do
         attr_json_sync_if_unsynced
       end
@@ -72,34 +68,22 @@ module AttrJson
       attr_json_sync_definitions(self.class.attr_json_registry.definitions)
     end
 
-    # A record loaded from the db has not synced its Rails attributes yet. An
-    # attribute nobody touched has no changes, so dirty tracking is right without
-    # the sync. Our getters and setters sync the attribute they are for. The
-    # methods below are the other ways to get at the value of a Rails attribute:
-    # each first runs the sync still owed, for one attribute if it is about one
-    # attribute, else for all of them.
+    # A record loaded from the db syncs lazily: each attribute when first needed,
+    # by our getter and setter or by the methods below, which are the other ways
+    # to reach the value of a rails attribute. Dirty tracking of the whole record
+    # needs no sync, as an attribute nobody touched has no changes.
 
-    # The *_for_database methods are not in every Rails version we support. We
-    # look for them in their module: mentioning ActiveRecord::Base here would
-    # load it too early.
+    # Some are not in every Rails version we support. (Asking ActiveRecord::Base
+    # here would load it too early.)
     before_type_cast = ActiveRecord::AttributeMethods::BeforeTypeCast
 
-    %i[attributes attributes_before_type_cast attributes_for_database].each do |method_name|
-      next if method_name == :attributes_for_database && !before_type_cast.method_defined?(method_name)
+    one_attribute_methods = %i[
+      read_attribute read_attribute_before_type_cast attribute_present? attribute_for_inspect
+      attribute_was attribute_in_database attribute_changed_in_place?
+    ]
+    one_attribute_methods << :read_attribute_for_database if before_type_cast.method_defined?(:read_attribute_for_database)
 
-      define_method(method_name) do
-        attr_json_sync_if_unsynced
-        super()
-      end
-    end
-
-    %i[
-      read_attribute read_attribute_before_type_cast read_attribute_for_database
-      attribute_present? attribute_for_inspect attribute_was attribute_in_database
-      attribute_changed_in_place?
-    ].each do |method_name|
-      next if method_name == :read_attribute_for_database && !before_type_cast.method_defined?(method_name)
-
+    one_attribute_methods.each do |method_name|
       define_method(method_name) do |attr_name, &block|
         attr_json_sync_if_unsynced(attr_name)
         super(attr_name, &block)
@@ -111,9 +95,20 @@ module AttrJson
       super
     end
 
-    def inspect
-      attr_json_sync_if_unsynced
-      super
+    # These read all rails attributes (attributes, pretty_print), copy or share
+    # them (dup, clone, becomes), make them unwritable (freeze, destroy, delete),
+    # or like a save replace them (touch).
+    all_attributes_methods = %i[attributes attributes_before_type_cast dup freeze destroy delete]
+    all_attributes_methods << :attributes_for_database if before_type_cast.method_defined?(:attributes_for_database)
+    # Later Rails #inspect uses #attribute_for_inspect, and with #inspect
+    # overridden would pretty_print differently.
+    all_attributes_methods << :inspect if ActiveRecord.version < Gem::Version.new("6.1")
+
+    all_attributes_methods.each do |method_name|
+      define_method(method_name) do
+        attr_json_sync_if_unsynced
+        super()
+      end
     end
 
     def pretty_print(pp)
@@ -121,13 +116,6 @@ module AttrJson
       super
     end
 
-    # A dup copies our Rails attributes.
-    def dup
-      attr_json_sync_if_unsynced
-      super
-    end
-
-    # A clone shares our Rails attributes, as does the record we become.
     def clone(**options)
       attr_json_sync_if_unsynced
       super
@@ -138,51 +126,30 @@ module AttrJson
       super
     end
 
-    # Nothing can be written to the Rails attributes once frozen.
-    def freeze
+    def touch(*names, **options)
       attr_json_sync_if_unsynced
       super
     end
 
-    # A destroyed record is frozen, and by then no longer #persisted?, which
-    # the sync looks at.
-    %i[destroy delete].each do |method_name|
-      define_method(method_name) do
-        attr_json_sync_if_unsynced
-        super()
-      end
-    end
-
-    # Like a save, replaces the Rails attributes, and can be rolled back.
-    def touch(*)
-      attr_json_sync_if_unsynced
-      super
-    end
-
-    # reload swaps in the Rails attributes of a freshly loaded record, which
-    # have not been synced. We do not defer here: if we are in a transaction
-    # that rolls back, the Rails attributes from before the reload come back,
-    # and those are synced.
+    # Not lazily: a transaction rollback can bring back the rails attributes
+    # from before the reload, which are synced.
     def reload(*)
       super.tap { attr_json_sync_to_rails_attributes }
     end
 
     private
 
-    # Every attribute still has to be synced, when first needed.
     def attr_json_defer_sync
       @attr_json_unsynced = Set.new(self.class.attr_json_registry.attribute_names)
     end
 
-    # Runs the sync a record loaded from the db deferred: for the one attribute
-    # named, or with no argument for all that are still unsynced. Does nothing
-    # if there is nothing left to sync, or the name is not an attr_json attribute.
+    # Sync the one attribute named if it is still unsynced, or with no argument
+    # all that are.
     def attr_json_sync_if_unsynced(attr_name = nil)
       unsynced = @attr_json_unsynced
       return if unsynced.nil?
 
-      # The sync itself reads and writes Rails attributes. With nothing marked
-      # unsynced meanwhile, that does not start another sync.
+      # so the rails attribute methods the sync calls do not start another sync
       @attr_json_unsynced = nil
 
       registry = self.class.attr_json_registry
@@ -204,8 +171,6 @@ module AttrJson
       end
     end
 
-    # Sync values FROM one json container TO the rails attributes of the
-    # definitions given, all of which are in that container.
     def attr_json_sync_from_container(container_attribute, definitions)
       # column may have eg been left out of an explicit 'select'
       return unless has_attribute?(container_attribute)
@@ -361,7 +326,7 @@ module AttrJson
         # like store_accessor tries!
         _attr_jsons_module.module_eval do
           define_method("#{name}=") do |value|
-            # so rails dirty tracking has the value from the db to compare to
+            # rails dirty tracking needs the value from the db to compare to
             attr_json_sync_if_unsynced(name)
 
             super(value) # should write to rails attribute
@@ -372,8 +337,7 @@ module AttrJson
             public_send(attribute_def.container_attribute)[attribute_def.store_key] = read_attribute(name)
           end
 
-          # Rails methods for this one attribute that read its rails attribute
-          # without going through anything we can override for all attributes.
+          # rails methods for this attribute that we can't override for all attributes at once
           %w[_before_type_cast _for_database _came_from_user? _will_change!].each do |suffix|
             # Rails 6.0 has no `name_for_database`
             next if suffix == "_for_database" && ActiveRecord.version < Gem::Version.new("6.1")
@@ -389,9 +353,8 @@ module AttrJson
             attribute_def = self.class.attr_json_registry.fetch(name.to_sym)
             container_value = public_send(attribute_def.container_attribute)
 
-            # A value that can be mutated in place has to be the same object in
-            # the rails attribute before we hand it out, for dirty tracking to
-            # see the mutation. A frozen one (nil, true, a number) can wait.
+            # for dirty tracking to see an in-place mutation of the value we return.
+            # A frozen value (nil, true, a number) can't be mutated.
             if @attr_json_unsynced && !container_value[attribute_def.store_key].frozen?
               attr_json_sync_if_unsynced(name)
             end
