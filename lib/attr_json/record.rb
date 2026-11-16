@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'set'
 require 'attr_json/attribute_definition'
 require 'attr_json/attribute_definition/registry'
 require 'attr_json/type/container_attribute'
@@ -27,9 +28,20 @@ module AttrJson
       class_attribute :attr_json_registry, instance_accessor: false
       self.attr_json_registry = AttrJson::AttributeDefinition::Registry.new
 
-      # Ensure that rails attributes tracker knows about values we just fetched
+      # Ensure that rails attributes tracker knows about values we just fetched.
+      #
+      # For a record loaded from the db the sync is deferred, so a record
+      # pays for it only if (and for the attributes where) it is needed.
+      # See #attr_json_sync_if_unsynced.
+      #
+      # A `dup` also arrives here as persisted, but with the instance variable
+      # already copied from its source; it is synced right away, as is a new record.
       after_initialize do
-        attr_json_sync_to_rails_attributes
+        if persisted? && !instance_variable_defined?(:@attr_json_unsynced)
+          attr_json_defer_sync
+        else
+          attr_json_sync_to_rails_attributes
+        end
       end
 
       # After a safe, rails attribute dirty tracking ends up re-creating
@@ -50,40 +62,164 @@ module AttrJson
     # mutation of mutable object will effect both places, for instance for dirty
     # tracking.
     def attr_json_sync_to_rails_attributes
-      self.class.attr_json_registry.definitions.group_by(&:container_attribute).each_pair do |container_attribute, definitions|
-        begin
-          # column may have eg been left out of an explicit 'select'
-          next unless has_attribute?(container_attribute)
+      @attr_json_unsynced = nil
+      attr_json_sync_definitions(self.class.attr_json_registry.definitions)
+    end
 
-          container_value    = public_send(container_attribute)
+    # The methods below are every way to get at the Rails attributes other than
+    # our own getters and setters. Each first runs the sync that a record loaded
+    # from the db still owes: for one attribute if it is about one attribute,
+    # else for all of them.
 
-          # isn't expected to be possible to be nil rather than empty hash, but
-          # if it is from some edge case, well, we don't have values to sync, fine
-          next if container_value.nil?
+    %i[attributes attributes_before_type_cast attributes_for_database].each do |method_name|
+      next unless ActiveRecord::AttributeMethods.method_defined?(method_name) ||
+        ActiveRecord::AttributeMethods::BeforeTypeCast.method_defined?(method_name)
 
-          definitions.each do |attribute_def|
-            attr_name     = attribute_def.name
-            value         = container_value[attribute_def.store_key]
-
-            unless value.nil?
-              # TODO, can we just make this use the setter?
-              write_attribute(attr_name, value)
-
-              clear_attribute_change(attr_name) if persisted?
-
-              # writing and clearning will result in a new object stored in
-              # rails attributes, we want
-              # to make sure the exact same object is in the json attribute,
-              # so in-place mutation changes to it are reflected in both places.
-              container_value[attribute_def.store_key] = read_attribute(attr_name)
-            end
-          end
-        rescue AttrJson::Type::Model::BadCast, AttrJson::Type::PolymorphicModel::TypeError => e
-          # There was bad data in the DB, we're just going to skip the Rails attribute sync.
-          # Should we log?
-        end
+      define_method(method_name) do
+        attr_json_sync_if_unsynced
+        super()
       end
     end
+
+    %i[read_attribute _read_attribute read_attribute_before_type_cast read_attribute_for_database].each do |method_name|
+      next unless ActiveRecord::AttributeMethods::Read.method_defined?(method_name) ||
+        ActiveRecord::AttributeMethods::BeforeTypeCast.method_defined?(method_name)
+
+      define_method(method_name) do |attr_name, &block|
+        attr_json_sync_if_unsynced(attr_name)
+        super(attr_name, &block)
+      end
+    end
+
+    def write_attribute(attr_name, value)
+      attr_json_sync_if_unsynced(attr_name)
+      super
+    end
+
+    # A dup copies our Rails attributes.
+    def dup
+      attr_json_sync_if_unsynced
+      super
+    end
+
+    # A clone shares our Rails attributes, as does the record we become.
+    def clone(**options)
+      attr_json_sync_if_unsynced
+      super
+    end
+
+    def becomes(klass)
+      attr_json_sync_if_unsynced
+      super
+    end
+
+    # Nothing can be written to the Rails attributes once frozen, as a
+    # destroyed record is.
+    def freeze
+      attr_json_sync_if_unsynced
+      super
+    end
+
+    # reload swaps in the Rails attributes of a freshly loaded record, which
+    # have not been synced.
+    def reload(*)
+      super.tap { attr_json_defer_sync }
+    end
+
+    private
+
+    # Every attribute still has to be synced, when first needed.
+    def attr_json_defer_sync
+      @attr_json_unsynced = Set.new(self.class.attr_json_registry.attribute_names)
+    end
+
+    # Runs the sync a record loaded from the db deferred: for the one attribute
+    # named, or with no argument for all that are still unsynced. Does nothing
+    # if there is nothing left to sync, or the name is not an attr_json attribute.
+    def attr_json_sync_if_unsynced(attr_name = nil)
+      unsynced = @attr_json_unsynced
+      return if unsynced.nil?
+
+      # The sync itself reads and writes Rails attributes. With nothing marked
+      # unsynced meanwhile, that does not start another sync.
+      @attr_json_unsynced = nil
+
+      registry = self.class.attr_json_registry
+      if attr_name
+        definition = registry[attr_name]
+        if definition && unsynced.delete?(definition.name)
+          attr_json_sync_from_container(definition.container_attribute, [definition])
+        end
+      else
+        attr_json_sync_definitions(registry.definitions.select { |definition| unsynced.delete?(definition.name) })
+      end
+    ensure
+      @attr_json_unsynced = unsynced unless unsynced.nil? || unsynced.empty?
+    end
+
+    # All of ActiveRecord's dirty tracking reads the Rails attributes through here.
+    def mutations_from_database
+      attr_json_sync_if_unsynced
+      super
+    end
+
+    # A rollback puts back the Rails attributes remembered here, which a save
+    # in the transaction replaces with new ones. Sync them before that happens.
+    def remember_transaction_record_state
+      attr_json_sync_if_unsynced
+      super
+    end
+
+    # What `name_before_type_cast`, `name_for_database` and `name_came_from_user?`
+    # are dispatched to.
+    %i[attribute_before_type_cast attribute_for_database attribute_came_from_user?].each do |method_name|
+      define_method(method_name) do |attr_name|
+        attr_json_sync_if_unsynced(attr_name)
+        super(attr_name)
+      end
+    end
+
+    def attr_json_sync_definitions(definitions)
+      definitions.group_by(&:container_attribute).each_pair do |container_attribute, container_definitions|
+        attr_json_sync_from_container(container_attribute, container_definitions)
+      end
+    end
+
+    # Sync values FROM one json container TO the rails attributes of the
+    # definitions given, all of which are in that container.
+    def attr_json_sync_from_container(container_attribute, definitions)
+      # column may have eg been left out of an explicit 'select'
+      return unless has_attribute?(container_attribute)
+
+      container_value    = public_send(container_attribute)
+
+      # isn't expected to be possible to be nil rather than empty hash, but
+      # if it is from some edge case, well, we don't have values to sync, fine
+      return if container_value.nil?
+
+      definitions.each do |attribute_def|
+        attr_name     = attribute_def.name
+        value         = container_value[attribute_def.store_key]
+
+        unless value.nil?
+          # TODO, can we just make this use the setter?
+          write_attribute(attr_name, value)
+
+          clear_attribute_change(attr_name) if persisted?
+
+          # writing and clearning will result in a new object stored in
+          # rails attributes, we want
+          # to make sure the exact same object is in the json attribute,
+          # so in-place mutation changes to it are reflected in both places.
+          container_value[attribute_def.store_key] = read_attribute(attr_name)
+        end
+      end
+    rescue AttrJson::Type::Model::BadCast, AttrJson::Type::PolymorphicModel::TypeError => e
+      # There was bad data in the DB, we're just going to skip the Rails attribute sync.
+      # Should we log?
+    end
+
+    public
 
     class_methods do
       # Access or set class-wide json_attribute_config. Inherited by sub-classes,
@@ -206,6 +342,9 @@ module AttrJson
         # like store_accessor tries!
         _attr_jsons_module.module_eval do
           define_method("#{name}=") do |value|
+            # so rails dirty tracking has the value from the db to compare to
+            attr_json_sync_if_unsynced(name)
+
             super(value) # should write to rails attribute
 
             # write to container hash, with value read from attribute to try to keep objects
@@ -217,7 +356,16 @@ module AttrJson
           define_method("#{name}") do
             # read from container hash -- we consider that the canonical location.
             attribute_def = self.class.attr_json_registry.fetch(name.to_sym)
-            public_send(attribute_def.container_attribute)[attribute_def.store_key]
+            container_value = public_send(attribute_def.container_attribute)
+
+            # A value that can be mutated in place has to be the same object in
+            # the rails attribute before we hand it out, for dirty tracking to
+            # see the mutation. A frozen one (nil, true, a number) can wait.
+            if @attr_json_unsynced && !container_value[attribute_def.store_key].frozen?
+              attr_json_sync_if_unsynced(name)
+            end
+
+            container_value[attribute_def.store_key]
           end
         end
 
