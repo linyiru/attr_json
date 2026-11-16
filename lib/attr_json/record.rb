@@ -79,7 +79,7 @@ module AttrJson
 
     one_attribute_methods = %i[
       read_attribute read_attribute_before_type_cast attribute_present? attribute_for_inspect
-      attribute_was attribute_in_database attribute_changed_in_place?
+      attribute_was attribute_in_database attribute_changed_in_place? attribute_change_to_be_saved
     ]
     one_attribute_methods << :read_attribute_for_database if before_type_cast.method_defined?(:read_attribute_for_database)
 
@@ -95,7 +95,26 @@ module AttrJson
       super
     end
 
-    # These read all rails attributes (attributes, pretty_print), copy or share
+    %i[attribute_changed? will_save_change_to_attribute?].each do |method_name|
+      define_method(method_name) do |attr_name, **options|
+        attr_json_sync_attribute_if_unsynced(attr_name)
+        super(attr_name, **options)
+      end
+    end
+
+    # Rails only sees a change in a container it has read, such as defaults
+    # for keys the db did not have.
+    %i[
+      changed? changed changes changed_attributes attributes_in_database
+      has_changes_to_save? changes_to_save changed_attribute_names_to_save
+    ].each do |method_name|
+      define_method(method_name) do
+        attr_json_read_containers if @attr_json_lazily_synced
+        super()
+      end
+    end
+
+    # These read all rails attributes (attributes, pretty_print, encode_with), copy or share
     # them (dup, clone, becomes), make them unwritable (freeze, destroy, delete),
     # or like a save replace them (touch).
     all_attributes_methods = %i[attributes attributes_before_type_cast dup freeze destroy delete]
@@ -116,16 +135,24 @@ module AttrJson
       super
     end
 
+    def encode_with(coder)
+      attr_json_sync_if_unsynced
+      super
+    end
+
     def clone(**options)
       attr_json_sync_if_unsynced
       super
     end
 
-    # Later Rails runs after_initialize on the record we become, which then
-    # believes it was just loaded, while it has our synced rails attributes.
+    # Later Rails runs after_initialize on the record we become when it has
+    # our rails attributes already. It then believes it was just loaded, where
+    # it used to sync.
     def becomes(klass)
       attr_json_sync_if_unsynced
-      super.tap { |became| became.instance_variable_set(:@attr_json_lazily_synced, nil) }
+      super.tap do |became|
+        became.attr_json_sync_to_rails_attributes if became.instance_variable_get(:@attr_json_lazily_synced)
+      end
     end
 
     def touch(*names, **options)
@@ -183,6 +210,12 @@ module AttrJson
       @attr_json_lazily_synced = synced
     end
 
+    def attr_json_read_containers
+      self.class.attr_json_registry.container_attributes.each do |container_attribute|
+        attr_json_container(container_attribute) if has_attribute?(container_attribute)
+      end
+    end
+
     def attr_json_container(container_attribute)
       return public_send(container_attribute) if @attr_json_lazily_synced.nil?
 
@@ -233,15 +266,8 @@ module AttrJson
       # A reader made by alias_attribute reads the rails attribute directly,
       # with nothing for us to override, so such a class syncs on load.
       def attr_json_lazy_sync?
-        if @attr_json_lazy_sync.nil?
-          @attr_json_lazy_sync = attribute_aliases.each_value.none? { |name| attr_json_registry.has_attribute?(name) }
-        end
-        @attr_json_lazy_sync
-      end
-
-      def alias_attribute(new_name, old_name)
-        @attr_json_lazy_sync = nil
-        super
+        attribute_aliases.empty? ||
+          attribute_aliases.each_value.none? { |name| attr_json_registry.has_attribute?(name) }
       end
 
       # Access or set class-wide json_attribute_config. Inherited by sub-classes,
@@ -325,8 +351,6 @@ module AttrJson
         # this container attribute hsa been encountered for this specific class. The registry
         # helps us keep track. Kinda messy, in future we may want a more explicit API
         # that does not require us to implicitly track first-time per-container.
-        @attr_json_lazy_sync = nil
-
         unless self.attr_json_registry.container_attribute_registered?(model: self, attribute_name: container_attribute.to_sym)
            attribute container_attribute.to_sym, AttrJson::Type::ContainerAttribute.new(self, container_attribute), default: -> { {} }
            self.attr_json_registry.register_container_attribute(model: self, attribute_name: container_attribute.to_sym)
@@ -412,6 +436,11 @@ module AttrJson
             define_method("#{container_attribute}=") do |value|
               attr_json_sync_if_unsynced
               super(value)
+            end
+
+            define_method("#{container_attribute}_change") do
+              attr_json_sync_if_unsynced
+              super()
             end
           end
         end

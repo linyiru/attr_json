@@ -348,6 +348,92 @@ RSpec.describe "lazy sync to rails attributes" do
       other = record.becomes(LazySyncProduct)
       [other.str_was, other.read_attribute(:int), other.changed?, other.attributes.except("id")]
     },
+    "becomes, after an in place mutation" => ->(record) {
+      record.str << "more"
+      other = record.becomes(LazySyncProduct)
+      before = [other.changed?, record.changed?, other.changes, record.changes]
+      [before, other.str, other.str_was, record.str_changed?]
+    },
+    "becomes a class that syncs on load" => ->(record) {
+      record.str = "new"
+      other = record.becomes(EagerSyncProduct)
+      [other.changes, record.changes, other.str, other.read_attribute(:int)]
+    },
+    "to_yaml" => ->(record) {
+      require "yaml"
+      record.to_yaml.gsub(/(Eager|Lazy)SyncProduct/, "Product").sub(/name: id\n\s+value_before_type_cast: \d+/, "name: id")
+    },
+    "a row without the keys that have defaults: dirty tracking" => ->(record) {
+      record.class.where(id: record.id).update_all("json_attributes = '{}', other_attributes = '{}'")
+      loaded = record.class.find(record.id)
+      [
+        loaded.changed?, loaded.changed.sort, loaded.changes, loaded.changed_attributes, loaded.attributes_in_database,
+        loaded.has_changes_to_save?, loaded.changes_to_save, loaded.changed_attribute_names_to_save.sort
+      ]
+    },
+    "a row without the keys that have defaults: dirty tracking of the container" => ->(record) {
+      record.class.where(id: record.id).update_all("json_attributes = '{}'")
+      [
+        record.class.find(record.id).json_attributes_changed?,
+        record.class.find(record.id).attribute_changed?(:json_attributes),
+        record.class.find(record.id).will_save_change_to_json_attributes?,
+        record.class.find(record.id).json_attributes_change,
+        record.class.find(record.id).json_attributes_change_to_be_saved,
+        record.class.find(record.id).json_attributes_was,
+        record.class.find(record.id).str_changed?
+      ]
+    },
+    "a row without the keys that have defaults: saved if changed" => ->(record) {
+      record.class.where(id: record.id).update_all("json_attributes = '{}'")
+      loaded = record.class.find(record.id)
+      loaded.save! if loaded.changed?
+      [loaded.saved_changes, loaded.str]
+    },
+    "a row without the keys that have defaults: saved" => ->(record) {
+      record.class.where(id: record.id).update_all("json_attributes = '{}'")
+      loaded = record.class.find(record.id)
+      loaded.save!
+      [loaded.saved_changes, loaded.changed?]
+    },
+    "a row without the keys that have defaults: touched" => ->(record) {
+      record.class.where(id: record.id).update_all("json_attributes = '{}'")
+      loaded = record.class.find(record.id)
+      loaded.touch(:datetime_type)
+      [loaded.changed?, loaded.changes.keys]
+    },
+    "YAML round trip" => ->(record) {
+      require "yaml"
+      yaml = record.to_yaml
+      copy = YAML.respond_to?(:unsafe_load) ? YAML.unsafe_load(yaml) : YAML.load(yaml)
+      [copy.read_attribute(:str), copy.int, copy.changes, copy.embedded]
+    },
+    "reload in a rolled back transaction, then an in place mutation" => ->(record) {
+      record.class.transaction do
+        record.reload
+        raise ActiveRecord::Rollback
+      end
+      record.str << "more"
+      record.embedded.str = "new"
+      [record.str_changed?, record.embedded_changed?, record.str.equal?(record.read_attribute(:str)), record.changes]
+    },
+    "with_lock in a rolled back transaction, then an in place mutation" => ->(record) {
+      record.class.transaction do
+        record.with_lock { record.int }
+        raise ActiveRecord::Rollback
+      end
+      record.str << "more"
+      [record.str_changed?, record.str.equal?(record.read_attribute(:str)), record.changes]
+    },
+    "touch and reload in a rolled back transaction, then an in place mutation" => ->(record) {
+      record.class.transaction do
+        record.touch(:datetime_type)
+        record.reload
+        raise ActiveRecord::Rollback
+      end
+      record.str << "more"
+      record.embedded.str = "new"
+      [record.str_changed?, record.embedded_changed?, record.str.equal?(record.read_attribute(:str)), record.changes.keys.sort]
+    },
     "becomes, with unsaved changes" => ->(record) {
       record.str = "new"
       record.embedded.str = "new"
@@ -412,6 +498,24 @@ RSpec.describe "lazy sync to rails attributes" do
       expect(record.title).to eq "stored"
       expect(record.title_was).to eq "stored"
       expect(record.title_changed?).to be false
+    end
+
+    it "reads and writes through the rails attribute methods with the alias" do
+      expect(aliasing_class.find(create_row).read_attribute(:title)).to eq "stored"
+      expect(aliasing_class.find(create_row)[:title]).to eq "stored"
+
+      record = aliasing_class.find(create_row)
+      record.title = "new"
+      expect(record.changes).to include("str" => ["stored", "new"])
+    end
+
+    it "is noticed when declared after the class was used" do
+      late_class = stub_const("LateAliasingProduct", Class.new(lazy_class))
+      id = create_row
+      late_class.find(id)
+      late_class.alias_attribute :title, :str
+
+      expect(late_class.find(id).title).to eq "stored"
     end
 
     it "does not stop its superclass from syncing lazily" do
