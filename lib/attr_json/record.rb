@@ -149,16 +149,19 @@ module AttrJson
       return if synced.nil? || !attr_name.respond_to?(:to_sym)
 
       registry = self.class.attr_json_registry
-      # someone with the container can change values before we synced them
-      return attr_json_sync_if_unsynced if registry.container_attribute?(attr_name)
-
       definition = registry[attr_name]
-      return if definition.nil? || synced.include?(definition.name)
+      if definition.nil?
+        # someone with the container can change values before we synced them
+        attr_json_sync_if_unsynced if registry.container_attribute?(attr_name)
+        return
+      end
+      return if synced.include?(definition.name)
 
       attr_json_without_lazy_sync do
         attr_json_sync_from_container(definition.container_attribute, [definition])
       end
       synced << definition.name
+      @attr_json_lazily_synced = nil if synced.size == registry.definitions.size
     end
 
     def attr_json_sync_if_unsynced
@@ -181,6 +184,8 @@ module AttrJson
     end
 
     def attr_json_container(container_attribute)
+      return public_send(container_attribute) if @attr_json_lazily_synced.nil?
+
       attr_json_without_lazy_sync { public_send(container_attribute) }
     end
 
@@ -373,11 +378,15 @@ module AttrJson
           end
 
           define_method("#{name}") do
-            attr_json_sync_attribute_if_unsynced(name)
-
             # read from container hash -- we consider that the canonical location.
             attribute_def = self.class.attr_json_registry.fetch(name.to_sym)
-            attr_json_container(attribute_def.container_attribute)[attribute_def.store_key]
+
+            if @attr_json_lazily_synced
+              attr_json_sync_attribute_if_unsynced(name)
+              attr_json_container(attribute_def.container_attribute)[attribute_def.store_key]
+            else
+              public_send(attribute_def.container_attribute)[attribute_def.store_key]
+            end
           end
 
           # rails methods for this attribute that we can't override for all attributes at once
